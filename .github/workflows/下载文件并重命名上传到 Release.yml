@@ -1,0 +1,122 @@
+name: 下载文件并重命名上传到 Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: >
+          JSON 对象，键为下载链接，值为上传后保存的文件名。
+          示例：{"https://example.com/file.zip": "my-file.zip", "https://example.com/setup.exe": "installer.exe"}
+        required: true
+        type: string
+      tag:
+        description: '目标 Release 的 tag（如 v1.7），不存在则自动创建'
+        required: true
+        type: string
+        default: 'v1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 并发下载并上传所有文件（最多 3 个并行任务）
+        shell: bash
+        env:
+          URLS_JSON: ${{ github.event.inputs.urls }}
+          TAG: ${{ github.event.inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # 清理 Windows 换行符，修复 JSON 末尾逗号
+          export URLS_JSON="$(printf '%s' "$URLS_JSON" | tr -d '\r')"
+          export URLS_JSON="$(printf '%s' "$URLS_JSON" | sed -Ez 's/,\s*(]|})/\1/g')"
+
+          COUNT=$(jq -n 'env.URLS_JSON | fromjson | keys | length')
+          echo "共有 ${COUNT} 个下载任务，最多 3 个并行"
+
+          # 确保 release 存在
+          if ! gh release view "${TAG}" &>/dev/null; then
+            echo "创建 release: ${TAG}"
+            gh release create "${TAG}" --title "${TAG}" --notes "自动下载上传"
+          else
+            echo "release ${TAG} 已存在，将上传文件"
+          fi
+
+          max_jobs=3
+          running=0
+          failed_tasks=()
+
+          for ((idx=0; idx<COUNT; idx++)); do
+            echo "========================================="
+            echo ">>> 启动任务 $((idx+1))/${COUNT}"
+
+            (
+              set -euo pipefail
+              tag="${TAG}"
+              url=$(jq -rn --argjson i "$idx" 'env.URLS_JSON | fromjson | to_entries | .[$i].key')
+              custom_name=$(jq -rn --argjson i "$idx" 'env.URLS_JSON | fromjson | to_entries | .[$i].value // ""')
+
+              if [[ -z "$url" ]]; then
+                echo "[任务 $idx] 错误：空链接，跳过"
+                exit 0
+              fi
+
+              # 确定最终文件名
+              if [[ -n "$custom_name" ]]; then
+                filename="$(basename "$custom_name" | tr -d '\r')"
+              else
+                filename="$(basename "${url%%\?*}" || true)"
+                if [[ -z "$filename" ]]; then
+                  filename="download"
+                fi
+                filename="$(printf '%s' "$filename" | tr -d '\r')"
+              fi
+              echo "[任务 $idx] 文件名: $filename"
+
+              task_dir=$(mktemp -d -t "dl-${idx}-XXXXX")
+              echo "[任务 $idx] 临时目录: $task_dir"
+              cleanup() { echo "[任务 $idx] 清理 $task_dir"; rm -rf "$task_dir"; }
+              trap cleanup EXIT
+
+              cd "$task_dir"
+
+              # 下载（最多重试 3 次）
+              echo "[任务 $idx] 下载: $url"
+              for attempt in 1 2 3; do
+                if curl -fsSL --retry 2 --max-time 1800 -o "$filename" "$url"; then
+                  echo "[任务 $idx] 下载成功"
+                  break
+                else
+                  echo "[任务 $idx] 下载失败，重试 $attempt/3 ..."
+                  sleep 5
+                fi
+              done
+              if [[ ! -f "$filename" ]]; then
+                echo "[任务 $idx] 下载最终失败"
+                exit 1
+              fi
+
+              # 上传到 Release（覆盖同名文件）
+              echo "[任务 $idx] 上传到 release ${tag}..."
+              gh release upload "${tag}" "$filename" --clobber
+
+              echo "[任务 $idx] 任务完成"
+            ) &  # 后台执行
+
+            running=$((running + 1))
+
+            # 控制并发数
+            if (( running >= max_jobs )); then
+              wait -n  # 等待任意一个后台任务结束
+              running=$((running - 1))
+            fi
+          done
+
+          wait  # 等待剩余后台任务全部完成
+
+          echo "所有任务处理完毕"
