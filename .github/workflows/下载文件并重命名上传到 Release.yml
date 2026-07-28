@@ -1,4 +1,4 @@
-name: 下载文件并重命名上传到 Release
+name: 下载文件并上传到 Release
 
 on:
   workflow_dispatch:
@@ -49,7 +49,6 @@ jobs:
 
           max_jobs=3
           running=0
-          failed_tasks=()
 
           for ((idx=0; idx<COUNT; idx++)); do
             echo "========================================="
@@ -78,6 +77,10 @@ jobs:
               fi
               echo "[任务 $idx] 文件名: $filename"
 
+              # 从URL自动提取Referer（使用域名部分）
+              referer="$(echo "$url" | awk -F/ '{printf "https://%s/", $3}')"
+              echo "[任务 $idx] Referer: $referer"
+
               task_dir=$(mktemp -d -t "dl-${idx}-XXXXX")
               echo "[任务 $idx] 临时目录: $task_dir"
               cleanup() { echo "[任务 $idx] 清理 $task_dir"; rm -rf "$task_dir"; }
@@ -85,10 +88,16 @@ jobs:
 
               cd "$task_dir"
 
-              # 下载（最多重试 3 次）
+              # 下载（添加浏览器请求头，最多重试 3 次）
               echo "[任务 $idx] 下载: $url"
               for attempt in 1 2 3; do
-                if curl -fsSL --retry 2 --max-time 1800 -o "$filename" "$url"; then
+                if curl -fsSL \
+                  --retry 2 \
+                  --max-time 1800 \
+                  -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36" \
+                  -H "Referer: ${referer}" \
+                  -o "$filename" \
+                  "$url"; then
                   echo "[任务 $idx] 下载成功"
                   break
                 else
