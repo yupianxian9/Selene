@@ -1,0 +1,341 @@
+# .github/workflows/sync-releases.yml
+name: Sync Releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: '源仓库 (格式: owner/repo)'
+        required: true
+        default: 'Spring691/dawn'
+  # schedule:
+  #   - cron: '0 0 * * *'
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: ${{ github.event.inputs.source_repo || 'yupianxian9/ToolKit' }}
+
+jobs:
+  # ==================== Release 同步（增量 + 附件补全 + 并发加速） ====================
+  sync-releases:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+
+      - name: Install GNU Parallel
+        run: sudo apt-get update && sudo apt-get install -y parallel
+
+      - name: Sync releases and assets with retry (parallel)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # ============================================
+          # 工具函数：带重试的附件下载
+          # ============================================
+          download_asset() {
+            local url="$1"
+            local output="$2"
+            local max_retries="${3:-3}"
+            local attempt=1
+            local wait_time=5
+
+            while [ $attempt -le $max_retries ]; do
+              echo "    下载尝试 ${attempt}/${max_retries}: $(basename "$output")"
+              if curl -sS --retry 3 --connect-timeout 30 --max-time 600 \
+                -L -H "Authorization: Bearer ${GH_TOKEN}" \
+                -o "$output" "$url"; then
+                echo "    下载成功。"
+                return 0
+              fi
+              echo "    下载失败。"
+              if [ $attempt -lt $max_retries ]; then
+                echo "    等待 ${wait_time} 秒后重试..."
+                sleep $wait_time
+                wait_time=$((wait_time + 5))
+              fi
+              attempt=$((attempt + 1))
+            done
+            echo "    [错误] 附件下载多次失败: $(basename "$output")"
+            return 1
+          }
+
+          # ============================================
+          # 工具函数：带重试的附件上传
+          # ============================================
+          upload_asset() {
+            local tag="$1"
+            local file="$2"
+            local max_retries="${3:-3}"
+            local attempt=1
+            local wait_time=5
+
+            while [ $attempt -le $max_retries ]; do
+              echo "    上传尝试 ${attempt}/${max_retries}: $(basename "$file")"
+              if gh release upload "$tag" "$file" --repo "$TARGET_REPO"; then
+                echo "    上传成功。"
+                return 0
+              fi
+              echo "    上传失败。"
+              if [ $attempt -lt $max_retries ]; then
+                echo "    等待 ${wait_time} 秒后重试..."
+                sleep $wait_time
+                wait_time=$((wait_time + 5))
+              fi
+              attempt=$((attempt + 1))
+            done
+            echo "    [错误] 附件上传多次失败: $(basename "$file")"
+            return 1
+          }
+
+          # 导出函数和变量供 parallel 使用
+          export -f download_asset upload_asset
+          export GH_TOKEN TARGET_REPO
+
+          # ============================================
+          # 主流程
+          # ============================================
+          echo "=== 获取源仓库所有 Release 元数据 ==="
+          gh api "repos/${SOURCE_REPO}/releases" \
+            --paginate > releases.json
+
+          release_count=$(jq '. | length' releases.json)
+          echo "共获取到 ${release_count} 个 Release"
+
+          default_branch=$(gh repo view --json defaultBranchRef -q '.defaultBranchRef.name')
+          echo "目标仓库默认分支：${default_branch}"
+
+          jq -r '.[].tag_name' releases.json | sort -V > sorted_tags.txt
+          echo "按版本排序后的 tag 列表："
+          cat sorted_tags.txt
+
+          while IFS= read -r tag; do
+            release=$(jq -c --arg tag "$tag" '.[] | select(.tag_name == $tag)' releases.json)
+            [ -z "$release" ] && continue
+
+            echo ""
+            echo "--- 处理 Release: ${tag} ---"
+
+            # 提取源附件信息（名称|下载URL）
+            source_assets=$(echo "$release" | jq -r '.assets[]? | "\(.name)|\(.browser_download_url)"')
+            source_names=$(echo "$source_assets" | cut -d'|' -f1)
+
+            if gh release view "$tag" --repo "$TARGET_REPO" &>/dev/null; then
+              echo "Release ${tag} 已存在，检查附件完整性..."
+
+              # 获取目标 Release 已有的附件名称
+              target_names=$(gh release view "$tag" --repo "$TARGET_REPO" --json assets | jq -r '.assets[].name')
+
+              # 找出缺失的附件
+              missing_names=$(comm -23 <(echo "$source_names" | sort) <(echo "$target_names" | sort))
+
+              if [ -z "$missing_names" ]; then
+                echo "  ✅ 所有附件完整，跳过。"
+                continue
+              fi
+
+              echo "  ⚠️ 缺失附件，开始补传（并发数：3）..."
+              tmp_dir=$(mktemp -d)
+              export tag tmp_dir
+
+              # 筛选出缺失的附件并喂给 parallel
+              echo "$source_assets" | grep -Ff <(echo "$missing_names") | \
+                parallel --colsep '\|' -j 3 '
+                  name={1}
+                  url={2}
+                  file_path="${tmp_dir}/${name}"
+                  echo "  [补传] $name"
+                  if download_asset "$url" "$file_path" 3; then
+                    upload_asset "$tag" "$file_path" 3
+                  else
+                    echo "  [警告] $name 下载失败，下次将重试"
+                  fi
+                  rm -f "$file_path"
+                '
+
+              rm -rf "$tmp_dir"
+              echo "缺失附件处理完毕。"
+            else
+              # Release 不存在，创建并上传全部附件
+              title=$(echo "$release" | jq -r '.name // .tag_name')
+              body=$(echo "$release" | jq -r '.body // ""')
+              draft=$(echo "$release" | jq -r '.draft // false')
+              prerelease=$(echo "$release" | jq -r '.prerelease // false')
+
+              flags=()
+              [ "$draft" = "true" ] && flags+=("--draft")
+              [ "$prerelease" = "true" ] && flags+=("--prerelease")
+
+              body_file=$(mktemp)
+              echo "$body" > "$body_file"
+
+              echo "创建 Release ${tag}..."
+              gh release create "$tag" \
+                --target "$default_branch" \
+                --title "$title" \
+                --notes-file "$body_file" \
+                "${flags[@]}" \
+                --repo "$TARGET_REPO"
+              rm -f "$body_file"
+
+              asset_count=$(echo "$release" | jq '.assets | length')
+              if [ "$asset_count" -gt 0 ]; then
+                tmp_dir=$(mktemp -d)
+                export tag tmp_dir
+                echo "共有 ${asset_count} 个附件，并发上传（并发数：3）..."
+
+                echo "$source_assets" | parallel --colsep '\|' -j 3 '
+                  name={1}
+                  url={2}
+                  file_path="${tmp_dir}/${name}"
+                  echo "  [并行] $name"
+                  if download_asset "$url" "$file_path" 3; then
+                    upload_asset "$tag" "$file_path" 3
+                  else
+                    echo "  [警告] $name 下载失败，下次可补传"
+                  fi
+                  rm -f "$file_path"
+                '
+
+                rm -rf "$tmp_dir"
+                echo "所有附件处理完毕。"
+              else
+                echo "该 Release 无附件。"
+              fi
+            fi
+
+            echo "Release ${tag} 处理完毕。"
+            sleep 5
+          done < sorted_tags.txt
+
+          echo ""
+          echo "=== 全部 Release 同步完成 ==="
+
+  # ==================== 源仓库文件同步（不变） ====================
+  sync-source-files:
+    needs: sync-releases
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync source repository files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXCLUDE: '.git .github'
+          BINARY_EXTENSIONS: "zip rar 7z exe msi crx msixbundle tar gz z01"
+          SIZE_THRESHOLD_MB: 50
+        run: |
+          set -euo pipefail
+
+          echo "=== 获取源仓库默认分支 ==="
+          DEFAULT_BRANCH=$(gh api repos/${SOURCE_REPO} --jq '.default_branch')
+          echo "源仓库: ${SOURCE_REPO}，分支: ${DEFAULT_BRANCH}"
+
+          TMP_DIR=$(mktemp -d)
+          echo "临时工作目录: $TMP_DIR"
+          cd "$TMP_DIR"
+
+          echo "=== 下载源仓库压缩包 ==="
+          ZIP_URL="https://api.github.com/repos/${SOURCE_REPO}/zipball/${DEFAULT_BRANCH}"
+          curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" -o source.zip "$ZIP_URL"
+
+          if ! unzip -tq source.zip >/dev/null 2>&1; then
+            echo "::error::下载的文件不是有效的 zip，请检查源仓库权限或是否存在。"
+            head -c 500 source.zip
+            exit 1
+          fi
+
+          echo "=== 解压并复制文件到目标仓库 ==="
+          unzip -q source.zip
+          ROOT_DIR=$(ls -d */ | head -1)
+          cd "$ROOT_DIR"
+
+          RSYNC_EXCLUDES=""
+          for pattern in $EXCLUDE; do
+            RSYNC_EXCLUDES="$RSYNC_EXCLUDES --exclude=$pattern"
+          done
+          rsync -av $RSYNC_EXCLUDES ./ $GITHUB_WORKSPACE/
+
+          rm -rf "$TMP_DIR"
+
+          echo "=== 配置 Git ==="
+          cd $GITHUB_WORKSPACE
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 1572864000
+
+          push_with_retry() {
+            local retries=3
+            local delay=10
+            for i in $(seq 1 $retries); do
+              echo "推送尝试 $i/$retries ..."
+              if git push; then
+                return 0
+              fi
+              echo "推送失败，${delay} 秒后重试..."
+              sleep $delay
+              delay=$((delay + 10))
+            done
+            return 1
+          }
+
+          echo "=== 识别需要单独提交的二进制文件 ==="
+
+          FIND_CONDITIONS=""
+          for ext in $BINARY_EXTENSIONS; do
+            FIND_CONDITIONS="$FIND_CONDITIONS -o -iname '*.$ext'"
+          done
+          FIND_CONDITIONS="${FIND_CONDITIONS# -o }"
+
+          if [ "${SIZE_THRESHOLD_MB:-0}" -gt 0 ]; then
+            SIZE_BYTES=$((SIZE_THRESHOLD_MB * 1024 * 1024))
+            FIND_CONDITIONS="( $FIND_CONDITIONS ) -o -size +${SIZE_BYTES}c"
+          fi
+
+          find . -path './.git' -prune -o -type f \( $FIND_CONDITIONS \) -print0 | sort -z | while IFS= read -r -d '' file; do
+            case "$file" in
+              ./.git/*|./.github/*) continue ;;
+            esac
+            echo "-------------------------------------------------"
+            echo "单独提交二进制文件: $file"
+
+            git reset --quiet HEAD -- .
+            git add -f "$file"
+
+            if git diff --cached --quiet; then
+              echo "文件无变化，跳过。"
+              continue
+            fi
+
+            git commit -m "Add/update $(basename "$file")"
+            if ! push_with_retry; then
+              echo "::error::推送 $file 失败，跳过并继续。"
+              git reset --soft HEAD~1
+            fi
+          done
+
+          echo "=== 提交剩余文件 ==="
+          git reset --quiet HEAD -- .
+          git add -f -A
+
+          if git diff --cached --quiet; then
+            echo "没有剩余文件需要提交。"
+          else
+            echo "剩余文件变更统计："
+            git diff --cached --stat
+            git commit -m "Sync remaining files from ${SOURCE_REPO} (${DEFAULT_BRANCH})"
+            if push_with_retry; then
+              echo "✅ 所有文件同步成功！"
+            else
+              echo "::error::剩余文件推送失败。"
+              exit 1
+            fi
+          fi
